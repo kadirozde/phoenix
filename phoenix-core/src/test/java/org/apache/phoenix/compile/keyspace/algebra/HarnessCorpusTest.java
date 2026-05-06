@@ -21,8 +21,17 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.query.BaseConnectionlessQueryTest;
+import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.query.QueryServicesOptions;
+import org.apache.phoenix.util.PropertiesUtil;
+import org.junit.Before;
 import org.junit.Test;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 
 /**
  * Drives the harness over a corpus of hand-picked SQL queries that exercise the scan-range
@@ -40,6 +49,27 @@ import org.junit.Test;
  * </ul>
  */
 public class HarnessCorpusTest extends BaseConnectionlessQueryTest {
+
+  /**
+   * The corpus harness decodes V2's compound-byte ScanRanges shape to compare against the
+   * abstract algebra reference. V1's per-slot byte form isn't compatible with the decoder;
+   * skip the suite when V2 is disabled.
+   */
+  @Before
+  public void requireV2Optimizer() {
+    org.junit.Assume.assumeTrue("HarnessCorpusTest is V2-only", isV2Enabled());
+  }
+
+  private static boolean isV2Enabled() {
+    try (Connection conn = DriverManager.getConnection(getUrl(),
+      PropertiesUtil.deepCopy(org.apache.phoenix.util.TestUtil.TEST_PROPERTIES))) {
+      return conn.unwrap(PhoenixConnection.class).getQueryServices().getConfiguration()
+        .getBoolean(QueryServices.WHERE_OPTIMIZER_V2_ENABLED,
+          QueryServicesOptions.DEFAULT_WHERE_OPTIMIZER_V2_ENABLED);
+    } catch (SQLException e) {
+      return false;
+    }
+  }
 
   private static final long GRID_SIZE_CAP = 5000;
 

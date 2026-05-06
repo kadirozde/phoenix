@@ -125,17 +125,11 @@ import org.apache.phoenix.thirdparty.com.google.common.collect.Lists;
     justification = "Test code.")
 public class QueryCompilerTest extends BaseConnectionlessQueryTest {
 
-  @Before
-  public void setUp() {
-    ParseNodeFactory.setTempAliasCounterValue(0);
-  }
-
   /**
-   * True when the V2 WHERE optimizer is enabled. V2 emits scan rows with its own
-   * well-defined encoding rules (per-dim separator bytes, nextKey on inclusive-upper,
-   * list-level byte-lex-min/max for multi-space) that differ superficially from V1's
-   * ScanUtil.setKey output but admit the same rows. Tests that assert specific byte
-   * shapes branch on this helper to pin the correct form for each configuration.
+   * True when the V2 WHERE optimizer is enabled for this test JVM. Tests whose expected
+   * scan bytes differ between V1 and V2 (typically a trailing SEP byte that V2 retains
+   * and V1 strips, or a tighter compound scan range that V2 produces) branch on this
+   * helper to pin both forms.
    */
   protected static boolean isV2Optimizer() {
     try (java.sql.Connection conn = java.sql.DriverManager.getConnection(getUrl(),
@@ -147,6 +141,11 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     } catch (java.sql.SQLException e) {
       return false;
     }
+  }
+
+  @Before
+  public void setUp() {
+    ParseNodeFactory.setTempAliasCounterValue(0);
   }
 
   @Test
@@ -1037,25 +1036,24 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: REGEXP_SUBSTR and RTRIM scalar functions on the LHS aren't yet
-  // resolved into scan key ranges. The scan runs with correct results but without
-  // the leading PK narrowing V1 produces. Follow-up: port scalar-function-into-keypart
-  // resolution from V1's WhereOptimizer to V2's visitor.
-  @org.junit.Ignore
   @Test
   public void testRegexpSubstrSetScanKeys() throws Exception {
+    // Same SEP-byte parity as testSubstrSetScanKey.
+    byte[] expectedStart = isV2Optimizer()
+      ? ByteUtil.concat(Bytes.toBytes("abc"), QueryConstants.SEPARATOR_BYTE_ARRAY)
+      : Bytes.toBytes("abc");
     // First test scan keys are set when the offset is 0 or 1.
     String query = "SELECT host FROM ptsdb WHERE regexp_substr(inst, '[a-zA-Z]+') = 'abc'";
     List<Object> binds = Collections.emptyList();
     Scan scan = compileQuery(query, binds);
-    assertArrayEquals(Bytes.toBytes("abc"), scan.getStartRow());
+    assertArrayEquals(expectedStart, scan.getStartRow());
     assertArrayEquals(ByteUtil.nextKey(Bytes.toBytes("abc")), scan.getStopRow());
     assertTrue(scan.getFilter() != null);
 
     query = "SELECT host FROM ptsdb WHERE regexp_substr(inst, '[a-zA-Z]+', 0) = 'abc'";
     binds = Collections.emptyList();
     scan = compileQuery(query, binds);
-    assertArrayEquals(Bytes.toBytes("abc"), scan.getStartRow());
+    assertArrayEquals(expectedStart, scan.getStartRow());
     assertArrayEquals(ByteUtil.nextKey(Bytes.toBytes("abc")), scan.getStopRow());
     assertTrue(scan.getFilter() != null);
 
@@ -1172,27 +1170,27 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     String query = "SELECT inst FROM ptsdb WHERE substr(inst, 0, 3) = 'abc'";
     List<Object> binds = Collections.emptyList();
     Scan scan = compileQuery(query, binds);
-    // V2 encoder emission appends the SEP after `inst` on the startRow because dim 0 is
-    // var-width and there are trailing PK columns; V1 strips it. Both ranges admit the
-    // same rows: any inst starting with "abc" has row-key bytes "abc·SEP·host·..." which
-    // satisfies both "≥ abc" (V1) and "≥ abc·SEP" (V2). StopRow is "abd" in both cases
-    // (nextKey of the exclusive-upper range bound, no SEP appended by either path).
+    // V2 encoder appends the SEP byte after `inst` on the startRow because dim 0 is
+    // var-width and there are trailing PK columns; V1 strips it. Both ranges admit
+    // the same rows.
     byte[] expectedStart = isV2Optimizer()
-      ? ByteUtil.concat(Bytes.toBytes("abc"), new byte[] { QueryConstants.SEPARATOR_BYTE })
+      ? ByteUtil.concat(Bytes.toBytes("abc"), QueryConstants.SEPARATOR_BYTE_ARRAY)
       : Bytes.toBytes("abc");
     assertArrayEquals(expectedStart, scan.getStartRow());
     assertArrayEquals(ByteUtil.nextKey(Bytes.toBytes("abc")), scan.getStopRow());
     assertTrue(scan.getFilter() == null); // Extracted.
   }
 
-  // V2 limitation: RTRIM scalar function on LHS isn't resolved into a scan key.
-  @org.junit.Ignore
   @Test
   public void testRTrimSetScanKey() throws Exception {
     String query = "SELECT inst FROM ptsdb WHERE rtrim(inst) = 'abc'";
     List<Object> binds = Collections.emptyList();
     Scan scan = compileQuery(query, binds);
-    assertArrayEquals(Bytes.toBytes("abc"), scan.getStartRow());
+    // Same SEP-byte parity as testSubstrSetScanKey.
+    byte[] expectedStart = isV2Optimizer()
+      ? ByteUtil.concat(Bytes.toBytes("abc"), QueryConstants.SEPARATOR_BYTE_ARRAY)
+      : Bytes.toBytes("abc");
+    assertArrayEquals(expectedStart, scan.getStartRow());
     assertArrayEquals(ByteUtil.nextKey(Bytes.toBytes("abc ")), scan.getStopRow());
     assertNotNull(scan.getFilter());
   }
@@ -2025,12 +2023,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: compound emission packs multiple PK columns into one slot,
-  // which OrderPreservingTracker.hasEqualityConstraint() can't always decompose
-  // per-column. For mixed equality+range predicates on consecutive PK columns the
-  // group-by isn't detected as order-preserving. Correctness unaffected — only a
-  // missed optimization.
-  @org.junit.Ignore
   @Test
   public void testGroupByOrderPreserving2() throws Exception {
     Connection conn = DriverManager.getConnection(getUrl());
@@ -5149,10 +5141,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // Pre-existing failure: optimizer picks data table over local index IDX for these
-  // queries on both V1 and V2 (the tiebreakers favor the data table when bound PK column
-  // counts match). Disabled until the cost-model heuristic is fixed.
-  @org.junit.Ignore
   @Test
   public void testLocalIndexRegionPruning() throws SQLException {
     Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
@@ -5472,10 +5460,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: group-by order-preserving detection doesn't always see per-column
-  // equality constraints inside compound slot emissions. Correctness unaffected — only
-  // a missed optimization. Same root cause as testGroupByOrderPreserving2.
-  @org.junit.Ignore
   @Test
   public void testGroupByOrderMatchPkColumnOrder4690() throws Exception {
     this.doTestGroupByOrderMatchPkColumnOrderBug4690(false, false);
@@ -7216,10 +7200,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: scalar function (TO_TIMESTAMP wrapper) on DESC indexed column isn't
-  // resolved as a scan key — falls back to full scan with residual filter. V1's
-  // scalar-function resolver handles this; porting it to V2 is a follow-up task.
-  @org.junit.Ignore
   @Test
   public void testReverseIndexRangeBugPhoenix6916() throws Exception {
     String tableName = generateUniqueName();
@@ -7240,10 +7220,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: DESC varlen compound bytes include a trailing separator that the
-  // EXPLAIN formatter re-decodes back as part of the column value, producing mangled
-  // output. Scan bytes are correct (same rows read); only the explain text differs.
-  @org.junit.Ignore
   @Test
   public void testReverseVarLengthRange6916() throws Exception {
     String tableName = generateUniqueName();
@@ -7259,10 +7235,8 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
       String openQry = "select * from " + tableName + " where k > 'a' and k<'aaa'";
       Scan openScan =
         getOptimizedQueryPlan(openQry, Collections.emptyList()).getContext().getScan();
-      // V2 appends a trailing DESC_SEPARATOR byte (0xFF) to the compound start/stop rows
-      // for varlen DESC PK ranges. Same scan region, byte-different from V1.
-      assertEquals("\\x9E\\x9E\\x9F\\x00\\xFF", Bytes.toStringBinary(openScan.getStartRow()));
-      assertEquals("\\x9E\\xFF\\xFF", Bytes.toStringBinary(openScan.getStopRow()));
+      assertEquals("\\x9E\\x9E\\x9F\\x00", Bytes.toStringBinary(openScan.getStartRow()));
+      assertEquals("\\x9E\\xFF", Bytes.toStringBinary(openScan.getStopRow()));
       ResultSet rs = stmt.executeQuery("EXPLAIN " + openQry);
       String explainPlan = QueryUtil.getExplainPlan(rs);
       assertEquals(explainExpected, explainPlan);
@@ -7270,7 +7244,7 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
       String closedQry = "select * from " + tableName + " where k >= 'a' and k <= 'aaa'";
       Scan closedScan =
         getOptimizedQueryPlan(closedQry, Collections.emptyList()).getContext().getScan();
-      assertEquals("\\x9E\\x9E\\x9E\\xFF\\xFF", Bytes.toStringBinary(closedScan.getStartRow()));
+      assertEquals("\\x9E\\x9E\\x9E\\xFF", Bytes.toStringBinary(closedScan.getStartRow()));
       assertEquals("\\x9F\\x00", Bytes.toStringBinary(closedScan.getStopRow()));
       rs = stmt.executeQuery("EXPLAIN " + closedQry);
       explainPlan = QueryUtil.getExplainPlan(rs);
@@ -7278,9 +7252,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: uncovered-index selection differs from V1 due to compound emission
-  // affecting the cost model's bound-PK-column-count comparison.
-  @org.junit.Ignore
   @Test
   public void testUncoveredPhoenix6969() throws Exception {
 
@@ -7295,12 +7266,22 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         + " where k4=1 and k2=1 order by k1 asc, v1 asc limit  1";
       ResultSet rs = stmt.executeQuery("EXPLAIN " + query);
       String explainPlan = QueryUtil.getExplainPlan(rs);
-      // We are more interested in the query compiling than the exact result
-      assertEquals("CLIENT PARALLEL 1-WAY RANGE SCAN OVER II [1]\n"
-        + "    SERVER MERGE [0.V1, 0.V2, 0.V3, 0.V4]\n"
-        + "    SERVER FILTER BY FIRST KEY ONLY AND \"K2\" = 1\n"
-        + "    SERVER TOP 1 ROW SORTED BY [\"K1\", \"V1\"]\n" + "CLIENT MERGE SORT\n"
-        + "CLIENT LIMIT 1", explainPlan);
+      // V1 emits a RANGE SCAN [1] with K2=1 in the server filter; V2 promotes the K2
+      // equality into the scan range itself via SKIP_SCAN ON 1 KEY [1,*,1] — either
+      // form is correct (same row set), differing only in where the K2=1 narrowing is
+      // applied (scan vs filter).
+      String expected = isV2Optimizer()
+        ? "CLIENT PARALLEL 1-WAY SKIP SCAN ON 1 KEY OVER II [1,*,1]\n"
+          + "    SERVER MERGE [0.V1, 0.V2, 0.V3, 0.V4]\n"
+          + "    SERVER FILTER BY FIRST KEY ONLY\n"
+          + "    SERVER TOP 1 ROW SORTED BY [\"K1\", \"V1\"]\n" + "CLIENT MERGE SORT\n"
+          + "CLIENT LIMIT 1"
+        : "CLIENT PARALLEL 1-WAY RANGE SCAN OVER II [1]\n"
+          + "    SERVER MERGE [0.V1, 0.V2, 0.V3, 0.V4]\n"
+          + "    SERVER FILTER BY FIRST KEY ONLY AND \"K2\" = 1\n"
+          + "    SERVER TOP 1 ROW SORTED BY [\"K1\", \"V1\"]\n" + "CLIENT MERGE SORT\n"
+          + "CLIENT LIMIT 1";
+      assertEquals(expected, explainPlan);
     }
   }
 
@@ -7359,9 +7340,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     }
   }
 
-  // V2 limitation: uncovered-index selection differs from V1 (same root cause as
-  // testUncoveredPhoenix6969).
-  @org.junit.Ignore
   @Test
   public void testUncoveredPhoenix6961() throws Exception {
     try (Connection conn = DriverManager.getConnection(getUrl());
@@ -7681,9 +7659,6 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
     assertEquals(isAscending, orderByExpression.isAscending());
   }
 
-  // V2 limitation: same root cause as testGroupByOrderPreserving2 — compound emission
-  // obscures per-column equality/range for UNION ALL order-by optimization.
-  @org.junit.Ignore
   @Test
   public void testUnionAllOrderByOptimizeBug7397() throws Exception {
     Properties props = new Properties();

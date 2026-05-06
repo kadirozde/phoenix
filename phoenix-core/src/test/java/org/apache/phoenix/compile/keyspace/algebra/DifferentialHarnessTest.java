@@ -41,7 +41,11 @@ import org.apache.phoenix.compile.ScanRanges;
 import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.jdbc.PhoenixPreparedStatement;
 import org.apache.phoenix.query.BaseConnectionlessQueryTest;
+import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.PTable;
+import org.apache.phoenix.util.PropertiesUtil;
+import org.junit.Before;
 import org.junit.Test;
 
 /**
@@ -70,6 +74,29 @@ import org.junit.Test;
  * </ol>
  */
 public class DifferentialHarnessTest extends BaseConnectionlessQueryTest {
+
+  /**
+   * The differential harness decodes V2's compound-byte ScanRanges shape via
+   * {@link ScanRangesDecoder} and compares it to the abstract algebra reference. V1's
+   * per-slot byte form isn't compatible with the V2 decoder (which expects per-tuple
+   * compound bytes), so under V1 the harness throws on byte-decode. Skip the suite
+   * when V2 is disabled — this is V2-only test infrastructure.
+   */
+  @Before
+  public void requireV2Optimizer() {
+    org.junit.Assume.assumeTrue("DifferentialHarnessTest is V2-only", isV2Enabled());
+  }
+
+  private static boolean isV2Enabled() {
+    try (Connection conn = DriverManager.getConnection(getUrl(),
+      PropertiesUtil.deepCopy(org.apache.phoenix.util.TestUtil.TEST_PROPERTIES))) {
+      return conn.unwrap(PhoenixConnection.class).getQueryServices().getConfiguration()
+        .getBoolean(QueryServices.WHERE_OPTIMIZER_V2_ENABLED,
+          QueryServicesOptions.DEFAULT_WHERE_OPTIMIZER_V2_ENABLED);
+    } catch (SQLException e) {
+      return false;
+    }
+  }
 
   /**
    * testRVCScanBoundaries1's first case, run through the harness.

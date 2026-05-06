@@ -498,6 +498,17 @@ public abstract class ExplainTable {
 
   }
 
+  /**
+   * True when the V2 WHERE optimizer is enabled for this query's connection. Used to
+   * scope V2-introduced explain-rendering features (compound-slot decomposition) so
+   * they don't alter V1's classical-optimizer explain output.
+   */
+  private boolean isV2OptimizerEnabled() {
+    return context.getConnection().getQueryServices().getConfiguration().getBoolean(
+      org.apache.phoenix.query.QueryServices.WHERE_OPTIMIZER_V2_ENABLED,
+      org.apache.phoenix.query.QueryServicesOptions.DEFAULT_WHERE_OPTIMIZER_V2_ENABLED);
+  }
+
   private void appendScanRow(StringBuilder buf, Bound bound) {
     ScanRanges scanRanges = context.getScanRanges();
     Iterator<byte[]> minMaxIterator = Collections.emptyIterator();
@@ -547,8 +558,15 @@ public abstract class ExplainTable {
       // On schema-iterator failure (mixed encodings / DESC with variable widths), fall
       // through to the legacy per-slot emission — garbled output is preferable to an
       // exception.
-      int span = (slotSpans != null && slotIdx < slotSpans.length && isNull == null
-        && b != null && b.length > 0) ? slotSpans[slotIdx] : 0;
+      // Compound-slot decomposition is V2-only: V2's emitV1Projection extends slotSpan
+      // on the trailing slot as a marker so SkipScanFilter steps the schema cursor
+      // through unconstrained PK columns. Decoding those compound bytes per-column
+      // produces a richer explain string. V1's classical optimizer also produces
+      // slotSpan > 0 (e.g. for RVC compound bytes), but its rendering convention is to
+      // show the leading column only — applying decomposition there changes long-stable
+      // V1 explain strings. Gate on V2 to keep V1's explain output unchanged.
+      int span = (isV2OptimizerEnabled() && slotSpans != null && slotIdx < slotSpans.length
+        && isNull == null && b != null && b.length > 0) ? slotSpans[slotIdx] : 0;
       if (span > 0) {
         RowKeySchema schema = scanRanges.getSchema();
         try {

@@ -909,6 +909,8 @@ public class KeySpaceExpressionVisitor
    */
   private Result scalarInViaKeyPart(InListExpression node, ScalarFunctionChain chain) {
     List<KeySpaceList> perValueLists = new java.util.ArrayList<>(node.getKeyExpressions().size());
+    PColumn column = table.getPKColumns().get(chain.pkPos);
+    boolean isDesc = column.getSortOrder() == org.apache.phoenix.schema.SortOrder.DESC;
     for (Expression v : node.getKeyExpressions()) {
       KeyRange range = chain.keyPart.getKeyRange(CompareOperator.EQUAL, v);
       if (range == null) {
@@ -917,16 +919,33 @@ public class KeySpaceExpressionVisitor
       if (range == KeyRange.EMPTY_RANGE) {
         continue;
       }
+      // Mirror visitLeave(ComparisonExpression)'s post-extraction invert: when the
+      // underlying PK column is DESC, the KeyPart emits ASC-encoded bytes and we
+      // need to invert them so ScanRanges sees DESC-encoded bytes that match the
+      // physical row layout. Without this the scan looks for ASC bytes in DESC
+      // storage and matches no rows.
+      if (isDesc) {
+        range = range.invert();
+      }
       perValueLists.add(KeySpaceList.of(KeySpace.single(chain.pkPos, range, nPkColumns)));
     }
     KeySpaceList acc = KeySpaceList.orAll(nPkColumns, perValueLists);
     if (acc.isUnsatisfiable()) {
       return Result.unsatisfiable(nPkColumns);
     }
+    // Only consume the IN node when the underlying scalar-function KeyPart reports the
+    // function as extractable. PrefixFunction.extractNode() defaults to false and is
+    // overridden to true only by order-preserving functions like SubstrFunction whose
+    // key range exactly matches the predicate (e.g. SUBSTR(p, 1, 3) = 'abc' is fully
+    // captured by the [abc, abd) PK range). Functions like RegexpSubstrFunction leave
+    // extractNode() at false because their PK range is a superset of the predicate —
+    // rows within the range may still not match the regex. For those the IN node must
+    // stay in the residual filter so the per-row check runs. See
+    // QueryPlanTest.testExplainPlan pair #29.
     Set<Expression> consumed = new HashSet<>();
-    consumed.add(node);
     Set<Expression> partExtracts = chain.keyPart.getExtractNodes();
-    if (partExtracts != null) {
+    if (partExtracts != null && !partExtracts.isEmpty()) {
+      consumed.add(node);
       consumed.addAll(partExtracts);
     }
     return new Result(acc, consumed);
@@ -961,11 +980,14 @@ public class KeySpaceExpressionVisitor
    * KeyParts operate on the outer, post-coerce form and V2 matches that.
    */
   private ScalarFunctionChain resolveScalarFunctionChain(Expression node) {
-    // Bare CoerceExpression wrapping an ASC PK column: handle specifically. This is the
-    // {@code TO_INTEGER(INT_COL1) = 2} pattern on uncovered-index plans, where Phoenix
-    // wraps the index-stored column in a CoerceExpression. The DESC variant is
-    // deliberately excluded — V1's DESC-RVC tests pin V2 at a non-extracted shape, and
-    // extending coerce-unwrap to DESC would change that behavior.
+    // Bare CoerceExpression wrapping a PK column: handle specifically. This is the
+    // {@code TO_INTEGER(INT_COL1) = 2} pattern on uncovered-index plans, and the
+    // {@code TO_TIMESTAMP("TS") >= ...} pattern on indexes whose stored type is
+    // VARBINARY (DESC indexes). Phoenix wraps the index-stored column in a
+    // CoerceExpression; we unwrap here so the comparison narrows the scan range.
+    // For DESC PK columns, the post-extraction invert in {@link #visitLeave(
+    // ComparisonExpression, List)} flips the ASC-encoded bytes the CoerceKeyPart emits
+    // into the DESC-encoded form ScanRanges expects.
     if (node instanceof org.apache.phoenix.expression.CoerceExpression
       && !node.getChildren().isEmpty()
       && node.getChildren().get(0) instanceof RowKeyColumnExpression) {
@@ -977,9 +999,6 @@ public class KeySpaceExpressionVisitor
         return null;
       }
       PColumn column = table.getPKColumns().get(pkPos);
-      if (column.getSortOrder() == org.apache.phoenix.schema.SortOrder.DESC) {
-        return null;
-      }
       org.apache.phoenix.compile.KeyPart base =
         new org.apache.phoenix.compile.WhereOptimizer.KeyExpressionVisitor.BaseKeyPart(table,
           column, new LinkedHashSet<Expression>(

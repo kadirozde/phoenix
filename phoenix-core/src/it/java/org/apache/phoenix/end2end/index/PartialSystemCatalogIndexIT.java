@@ -839,12 +839,21 @@ public class PartialSystemCatalogIndexIT extends ParallelStatsDisabledIT {
     plans = getExplain(
       "select ROW_KEY_MATCHER, TTL, TABLE_NAME FROM SYSTEM.CATALOG WHERE TABLE_TYPE = 'v' AND ROW_KEY_MATCHER IS NOT NULL",
       new Properties());
-    // V2 extracts the trailing TABLE_TYPE='v' predicate into the scan's stop-row past
-    // the middle-EVERYTHING gap, emitting SKIP SCAN ON 1 RANGE with `[not null,*,'v']`.
-    // V1 kept TABLE_TYPE as a server filter and emitted RANGE SCAN with `[not null]`.
-    // Both scans return the same rows; V2's bounds are tighter.
-    assertEquals(String.format("CLIENT PARALLEL 1-WAY SKIP SCAN ON 1 RANGE OVER %s [not null,*,'v']",
-      FULL_SYS_ROW_KEY_MATCHER_TEST_INDEX_NAME), plans.get(0));
+    // V1 narrows only on the leading `ROW_KEY_MATCHER IS NOT NULL` and emits
+    // `RANGE SCAN [not null]`, leaving `TABLE_TYPE = 'v'` on a trailing PK
+    // column as a server filter. V2 emits the full compound across the middle-
+    // EVERYTHING gap, projecting the trailing `TABLE_TYPE = 'v'` point into the
+    // stop-row → `SKIP SCAN ON 1 RANGE [not null,*,'v']`. V2 is strictly better:
+    // HBase rejects rows whose TABLE_TYPE ≠ 'v' before they reach the server
+    // filter, the index range walked is much narrower (TABLE_TYPE has many
+    // distinct values in SYSTEM.CATALOG, so projecting `='v'` substantially
+    // shrinks the scan), and the dropped server filter saves CPU. Same rows.
+    String expectedPlan = isV2Optimizer()
+      ? String.format("CLIENT PARALLEL 1-WAY SKIP SCAN ON 1 RANGE OVER %s [not null,*,'v']",
+        FULL_SYS_ROW_KEY_MATCHER_TEST_INDEX_NAME)
+      : String.format("CLIENT PARALLEL 1-WAY RANGE SCAN OVER %s [not null]",
+        FULL_SYS_ROW_KEY_MATCHER_TEST_INDEX_NAME);
+    assertEquals(expectedPlan, plans.get(0));
 
     /**
      * Testing cleanup of SYS_INDEX rows after dropping tables and views

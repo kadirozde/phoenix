@@ -768,10 +768,23 @@ public class ScanRanges {
         }
         // Compound slot (slotSpan > 0) with a range bound: the slot as a whole isn't a
         // single key, but one or more sub-positions packed into the compound may still
-        // be pinned. For each sub-position, the bound bytes at that field's offset are
-        // pinned iff both the lower and upper bytes are identical at that field in the
-        // compound. Walk the schema starting from the slot's leading PK column to
-        // extract the byte range for pkPosition in both bounds, then compare.
+        // be pinned. The compound represents an N-dim box where the leading dims are
+        // pinned to point values and a trailing run of dims expresses an open or
+        // half-open range. The decomposition must recognize three byte-shape cases:
+        //
+        //  (a) lower and upper agree at every field up through {@code pkPosition} —
+        //      classical V1 form for compound equality with a trailing range. Each
+        //      pre-divergence field is equality.
+        //  (b) lower and upper diverge at field f, but {@code upper} is exactly
+        //      {@code lower[..f_end]} with the last byte bumped (i.e., upper is
+        //      `nextKey` of the cumulative lower prefix ending at f) and upper has no
+        //      bytes past f. f is equality — the upper expresses an exclusive next-
+        //      prefix boundary, equivalent to a point on field f. Fields beyond f in
+        //      lower contribute the range portion. This is the V2 compound-emission
+        //      shape for "equality on leading dims + range on trailing dim(s)".
+        //  (c) lower and upper diverge at field f and case (b) doesn't hold —
+        //      f is the first range field; equality holds for fields strictly less
+        //      than f.
         if (slotSpan[i] == 0 || schema == null) {
           return false;
         }
@@ -782,18 +795,45 @@ public class ScanRanges {
           return false;
         }
         int slotLeadingPk = pkOffset;
-        org.apache.hadoop.hbase.io.ImmutableBytesWritable lowerPtr =
-          new org.apache.hadoop.hbase.io.ImmutableBytesWritable(lower, 0, lower.length);
-        if (!schema.position(lowerPtr, slotLeadingPk, pkPosition)) {
+        for (int fieldPos = slotLeadingPk; fieldPos <= pkPosition; fieldPos++) {
+          org.apache.hadoop.hbase.io.ImmutableBytesWritable lo =
+            new org.apache.hadoop.hbase.io.ImmutableBytesWritable(lower, 0, lower.length);
+          if (!schema.position(lo, slotLeadingPk, fieldPos)) {
+            return false;
+          }
+          org.apache.hadoop.hbase.io.ImmutableBytesWritable up =
+            new org.apache.hadoop.hbase.io.ImmutableBytesWritable(upper, 0, upper.length);
+          boolean upperHasField = schema.position(up, slotLeadingPk, fieldPos);
+          if (!upperHasField) {
+            // Upper exhausted before reaching {@code fieldPos}. The leading equality
+            // run ended earlier; {@code fieldPos} is in the range portion.
+            return false;
+          }
+          if (Bytes.equals(lo.get(), lo.getOffset(), lo.getLength(),
+            up.get(), up.getOffset(), up.getLength())) {
+            // Field equal in both bounds — this dim is pinned. Continue to next.
+            continue;
+          }
+          // Bytes diverge at {@code fieldPos}. Check case (b): is upper's bytes at
+          // {@code fieldPos} the next-key bump of lower's bytes at the same offset
+          // AND is upper's tail empty past this field? If so, this field is the last
+          // equality field (the upper is the exclusive next-prefix boundary).
+          int upperEnd = up.getOffset() + up.getLength();
+          if (upperEnd != upper.length) {
+            // Upper has more bytes past {@code fieldPos} — not a next-prefix boundary.
+            return false;
+          }
+          byte[] loField = new byte[lo.getLength()];
+          System.arraycopy(lo.get(), lo.getOffset(), loField, 0, lo.getLength());
+          byte[] upField = new byte[up.getLength()];
+          System.arraycopy(up.get(), up.getOffset(), upField, 0, up.getLength());
+          byte[] loFieldNext = org.apache.phoenix.util.ByteUtil.nextKey(loField);
+          if (loFieldNext != null && Bytes.equals(loFieldNext, upField)) {
+            return true;
+          }
           return false;
         }
-        org.apache.hadoop.hbase.io.ImmutableBytesWritable upperPtr =
-          new org.apache.hadoop.hbase.io.ImmutableBytesWritable(upper, 0, upper.length);
-        if (!schema.position(upperPtr, slotLeadingPk, pkPosition)) {
-          return false;
-        }
-        return Bytes.equals(lowerPtr.get(), lowerPtr.getOffset(), lowerPtr.getLength(),
-          upperPtr.get(), upperPtr.getOffset(), upperPtr.getLength());
+        return true;
       }
       pkOffset += slotSpan[i] + 1;
     }

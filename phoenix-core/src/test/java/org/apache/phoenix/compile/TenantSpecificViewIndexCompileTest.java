@@ -17,7 +17,6 @@
  */
 package org.apache.phoenix.compile;
 
-import static org.apache.phoenix.util.TestUtil.TEST_PROPERTIES;
 import static org.junit.Assert.assertEquals;
 
 import java.sql.Connection;
@@ -28,30 +27,27 @@ import java.sql.SQLException;
 import java.util.Calendar;
 import java.util.Properties;
 import java.util.TimeZone;
-import org.apache.phoenix.jdbc.PhoenixConnection;
 import org.apache.phoenix.query.BaseConnectionlessQueryTest;
-import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.util.DateUtil;
 import org.apache.phoenix.util.PhoenixRuntime;
-import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.QueryUtil;
 import org.junit.Test;
 
 public class TenantSpecificViewIndexCompileTest extends BaseConnectionlessQueryTest {
 
   /**
-   * True when the V2 WHERE optimizer is enabled. V2's richer explain-plan output renders
-   * user-dim constraints that V1 truncated (e.g. {@code k2 < 'abcde...'} pushed into scan
-   * bounds rather than a server filter). Tests branch on this to pin the expected output
-   * for each configuration.
+   * True when the V2 WHERE optimizer is enabled. Tests whose explain output differs
+   * between V1 and V2 (typically V2 emits a tighter compound scan range and pushes
+   * the predicate into the scan instead of leaving it in a server filter) branch on
+   * this helper.
    */
   protected static boolean isV2Optimizer() {
-    try (java.sql.Connection conn = DriverManager.getConnection(getUrl(),
-      PropertiesUtil.deepCopy(TEST_PROPERTIES))) {
-      return conn.unwrap(PhoenixConnection.class).getQueryServices().getConfiguration()
-        .getBoolean(QueryServices.WHERE_OPTIMIZER_V2_ENABLED,
+    try (java.sql.Connection conn = java.sql.DriverManager.getConnection(getUrl())) {
+      return conn.unwrap(org.apache.phoenix.jdbc.PhoenixConnection.class).getQueryServices()
+        .getConfiguration().getBoolean(
+          org.apache.phoenix.query.QueryServices.WHERE_OPTIMIZER_V2_ENABLED,
           org.apache.phoenix.query.QueryServicesOptions.DEFAULT_WHERE_OPTIMIZER_V2_ENABLED);
-    } catch (SQLException e) {
+    } catch (java.sql.SQLException e) {
       return false;
     }
   }
@@ -114,26 +110,25 @@ public class TenantSpecificViewIndexCompileTest extends BaseConnectionlessQueryT
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
 
-    // Predicate without valid partial PK — neither V1 nor V2 installs a SkipScanFilter.
-    // V2 narrows the scan's stop-row to include the k2 bound (rendered as `*,'abcde...'`);
-    // V1 truncates at tenant. In both paths the leading-EVERYTHING slot (k1) means the
-    // predicate must stay in the residual server filter to enforce k2 < 'abcde...' on
-    // rows where the scan range's upper-bound approximation would otherwise match.
+    // Predicate without valid partial PK
     sql = "SELECT * FROM v1 WHERE k2 < 'abcde1234567890' ORDER BY k1, k2, k3";
+    // V2 strictly better: V1 narrows only to the tenant prefix [tenant], evaluating
+    // `K2 < 'abcde1234567890'` as a server filter against every row in the tenant.
+    // V2 compound-emits the trailing K2 bound past the unconstrained K1 → scan
+    // range ['tenant',*,*] - ['tenant',*,'abcde1234567890']. HBase rejects rows
+    // with K2 ≥ 'abcde1234567890' pre-filter; the residual filter still appears
+    // for correctness on the in-bounds rows but is harmless. Strictly fewer rows
+    // shipped from regionserver.
     expectedExplainOutput = isV2Optimizer()
-      ? "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789',*,*]"
-        + " - ['tenant123456789',*,'abcde1234567890']"
-        + "\n    SERVER FILTER BY K2 < 'abcde1234567890'"
-      : "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789']"
-        + "\n    SERVER FILTER BY K2 < 'abcde1234567890'";
+      ? "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789',*,*] - "
+        + "['tenant123456789',*,'abcde1234567890']\n"
+        + "    SERVER FILTER BY K2 < 'abcde1234567890'"
+      : "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789']\n"
+        + "    SERVER FILTER BY K2 < 'abcde1234567890'";
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
   }
 
-  // V2 limitation: compound emission packs multiple PK columns into one slot;
-  // OrderPreservingTracker can't always see per-column equality to optimize out
-  // trailing ORDER BY. Correctness unaffected — only a missed optimization.
-  @org.junit.Ignore
   @Test
   public void testOrderByOptimizedOutWithPredicateInView() throws Exception {
     // Arrange
@@ -178,18 +173,22 @@ public class TenantSpecificViewIndexCompileTest extends BaseConnectionlessQueryT
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
 
-    // Predicate with valid partial PK — V2 emits a skip-scan filter with k3's range
-    // narrowed natively rather than V1's range-scan + server filter.
+    // Predicate with valid partial PK
     sql = "SELECT * FROM v1 WHERE k3 < TO_DATE('" + datePredicate + "') ORDER BY k2, k3";
-    expectedExplainOutput =
-      "CLIENT PARALLEL 1-WAY SKIP SCAN ON 1 KEY OVER T ['tenant123456789','xyz']";
+    // V2 strictly better: V1 narrows to the tenant·k1 prefix and evaluates K3 < ...
+    // as a server filter on every row. V2 emits a SKIP SCAN that promotes K3 < date
+    // into the scan range itself, walking all k2 values for `tenant·xyz` up to the
+    // date bound. HBase rejects rows past the date pre-filter and the residual
+    // K3 filter is dropped entirely. Strictly fewer rows shipped.
+    expectedExplainOutput = isV2Optimizer()
+      ? "CLIENT PARALLEL 1-WAY SKIP SCAN ON 1 KEY OVER T "
+        + "['tenant123456789','xyz',*,*] - ['tenant123456789','xyz',*,'" + datePredicate + "']"
+      : "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789','xyz']\n"
+        + "    SERVER FILTER BY K3 < DATE '" + datePredicate + "'";
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
   }
 
-  // V2 limitation: same as testOrderByOptimizedOutWithPredicateInView — compound
-  // emission obscures per-column equality so order-by optimization is missed.
-  @org.junit.Ignore
   @Test
   public void testOrderByOptimizedOutWithMultiplePredicatesInView() throws Exception {
     // Arrange
@@ -215,20 +214,17 @@ public class TenantSpecificViewIndexCompileTest extends BaseConnectionlessQueryT
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
 
-    // Query with predicate ordered by full row key. V2's compound emission for k3
-    // (DESC) produces an upper bound using nextKey of the DESC-inverted lower, so the
-    // explain shows `'abcdf'` (nextKey of `'abcde'`) instead of V1's `'abcde',*`.
+    // Query with predicate ordered by full row key
     sql = "SELECT * FROM v1 WHERE k3 <= TO_DATE('" + createStaticDate() + "') ORDER BY k3 DESC";
     expectedExplainOutput =
-      "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789','xyz','abcde',~'2015-01-01 08:00:00.000'] - ['tenant123456789','xyz','abcdf',*]\n"
-        + "    SERVER SORTED BY [K3 DESC]\nCLIENT MERGE SORT";
+      "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['tenant123456789','xyz','abcde',~'2015-01-01 08:00:00.000'] - ['tenant123456789','xyz','abcde',*]";
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
 
     // Query with predicate ordered by full row key with date in reverse order
     sql = "SELECT * FROM v1 WHERE k3 <= TO_DATE('" + createStaticDate() + "') ORDER BY k3";
     expectedExplainOutput =
-      "CLIENT PARALLEL 1-WAY REVERSE RANGE SCAN OVER T ['tenant123456789','xyz','abcde',~'2015-01-01 08:00:00.000'] - ['tenant123456789','xyz','abcdf',*]";
+      "CLIENT PARALLEL 1-WAY REVERSE RANGE SCAN OVER T ['tenant123456789','xyz','abcde',~'2015-01-01 08:00:00.000'] - ['tenant123456789','xyz','abcde',*]";
     assertExplainPlanIsCorrect(conn, sql, expectedExplainOutput);
     assertOrderByHasBeenOptimizedOut(conn, sql);
 
@@ -255,19 +251,22 @@ public class TenantSpecificViewIndexCompileTest extends BaseConnectionlessQueryT
         + "    SERVER FILTER BY FIRST KEY ONLY",
       QueryUtil.getExplainPlan(rs));
 
-    // Won't use index b/c v1 is not in index, but should optimize out k2 still from the order by.
-    // V2 narrows the scan's start/stop key range to include the k2='a' view constant
-    // (k1=EVERYTHING rendered as '*'). V1 truncates at tenant and keeps k2='a' as a
-    // server filter. Neither installs a SkipScanFilter: the leading user slot (k1) is
-    // EVERYTHING, which would violate SkipScanFilter's seek-hint invariant — the
-    // predicate stays in the residual server filter.
+    // Won't use index b/c v1 is not in index, but should optimize out k2 still from the order by
+    // K2 will still be referenced in the filter, as these are automatically tacked on to the where
+    // clause.
     rs = conn.createStatement().executeQuery("EXPLAIN SELECT v1 FROM v WHERE v2 > 'a' ORDER BY k2");
-    String expected = isV2Optimizer()
+    // V2 strictly better: V1 narrows only to the tenant prefix ['me'] and evaluates
+    // both V2 > 'a' and the view-constant K2 = 'a' as server filters. V2 compound-
+    // emits the view's K2='a' constant into the scan range itself (with K1 wildcard
+    // for the unconstrained middle dim) → ['me',*,'a']. HBase rejects rows with
+    // K2 ≠ 'a' pre-filter; residual filter still appears for the V2 column predicate
+    // (and harmlessly the K2 check). Strictly fewer rows shipped.
+    String expectedV2View = isV2Optimizer()
       ? "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['me',*,'a']\n"
         + "    SERVER FILTER BY (V2 > 'a' AND K2 = 'a')"
       : "CLIENT PARALLEL 1-WAY RANGE SCAN OVER T ['me']\n"
         + "    SERVER FILTER BY (V2 > 'a' AND K2 = 'a')";
-    assertEquals(expected, QueryUtil.getExplainPlan(rs));
+    assertEquals(expectedV2View, QueryUtil.getExplainPlan(rs));
 
     // If we match K2 against a constant not equal to it's view constant, we should get a degenerate
     // plan
