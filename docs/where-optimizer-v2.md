@@ -447,7 +447,40 @@ phoenix.where.optimizer.v2.cartesianBound   (default 50000, same magnitude as le
 
 `WhereOptimizer.pushKeyExpressionsToScan` branches on the flag near the top and delegates to `WhereOptimizerV2.run` when enabled. Both entry callers (`WhereCompiler` and `RVCOffsetCompiler`) go through the same public method, so no caller-side changes.
 
-The same test suites run under both flag values. The 138 `WhereOptimizerTest` methods are re-run via a `WhereOptimizerV2Test` subclass that forces the flag on; divergences that are cosmetic (explain-string shape, byte-level detail of equivalent scans) are documented per-assertion with conditional checks; divergences that are semantic are tracked as V2 regressions until fixed.
+The same test suites run under both flag values via a system-property switch rather than sibling test classes. `BaseTest.initDriver` reads `-Dphoenix.where.optimizer.v2.enabled=...` from the JVM and layers it into the `PhoenixTestDriver` config; `pom.xml`'s surefire and failsafe `systemPropertyVariables` blocks forward the maven-level property into the forked test JVMs. Tests with V1↔V2 divergent expected output use the shared `BaseTest.isV2Optimizer()` helper to branch their assertions:
+
+```java
+String expected = isV2Optimizer() ? V2_FORM : V1_FORM;
+assertEquals(expected, actualPlan);
+```
+
+This lets the same test class assert the right shape under either mode, exercised in CI by re-running the suite with `-Dphoenix.where.optimizer.v2.enabled=true` and `-Dphoenix.where.optimizer.v2.enabled=false`. Each dual-pin block carries a comment categorizing the divergence as one of: **V2 strictly better** (V2 narrows the scan range; HBase rejects rows pre-filter), **V2 marginally worse but correct** (V2 retains a redundant residual that the scan range already enforces; same row count, slight per-row CPU cost), or **V1 strictly better — known V2 limitation** (TODO; see §11).
+
+Two test-side helpers compress the most common divergence patterns:
+
+- `WhereOptimizerTest.v2OptionalSep()` returns the SEP byte under V2 and an empty array under V1 — used in the trailing-PK byte-shape divergence (V2's compound emission preserves the SEP byte that V1's `ScanUtil.setKey` per-slot path strips).
+- The two algebra differential-test classes (`HarnessCorpusTest`, `DifferentialHarnessTest`) gate themselves on `Assume.assumeTrue(isV2Enabled())` because their decoder reads V2's compound-byte ScanRanges shape; under V1 they skip cleanly rather than emit garbage.
+
+**Running the suites in either mode.**
+
+```bash
+# V2 (default) — unit + IT in one invocation:
+mvn -pl phoenix-core verify -DnumForkedIT=12 -Dsurefire.Xmx=4096m -DfailIfNoTests=false
+
+# V1 (legacy) — same, with the override flag flipped off:
+mvn -pl phoenix-core verify -DnumForkedIT=12 -Dsurefire.Xmx=4096m \
+    -Dphoenix.where.optimizer.v2.enabled=false -DfailIfNoTests=false
+```
+
+Most recent dual-mode sweep (commit `d903f1e87`):
+
+| | V1 mode | V2 mode |
+|---|---|---|
+| Unit tests | 2538 / 0 fail / 15 skipped | 2538 / 0 fail / 9 skipped (algebra harness runs under V2) |
+| Integration tests | 4412 / 0 V2-related fail / 275 skipped | 4412 / 0 V2-related fail / 275 skipped |
+| Wall clock | ~2h 6min | ~2h 21min |
+
+The single environmental error in both modes is `SecureUserConnectionsIT.testMultipleConnectionsAsSameUserWithoutLogin` (`Couldn't get the current user`) — pre-existing, unrelated to V2.
 
 ---
 
@@ -513,6 +546,11 @@ The V1 heuristic ("force RANGE SCAN above cardinality 15 with DESC") was written
 - RVC inequality that lex-expands cleanly — V2's normalizer produces the same compound key region as V1.
 
 **Shapes where V2 currently reads more than V1** — none documented. The known limitations (§11.1, §11.2) represent shapes where V2 does **no worse** than V1 — both fall back to full scan + residual filter.
+
+**Shape divergences that look like a regression in the explain string but aren't.** A handful of dual-pinned regression tests show V2 producing a different explain string than V1, where the underlying scan region is identical or V2's is strictly tighter. Two representative examples (full list in §11.4):
+
+- **`regexp_substr` IN-list with consecutive values** — `QueryPlanTest.testExplainPlan` pair #29. V1 emits `SKIP SCAN ON 3 RANGES [na1, na2)·[na2, na3)·[na3, na4)`; V2 coalesces to a single `RANGE SCAN [na1, na4)`. The IN values are consecutive so V1's three sub-ranges contain no gaps — both plans cover identical bytes and the residual `REGEXP_SUBSTR(...) IN (...)` filter is identical on both. V2's coalesced single seek is at worst equivalent to and likely cheaper than V1's three-hop SKIP SCAN.
+- **RVC `>=` with leading-PK range** — `QueryPlanTest.testExplainPlan` pair #9. V1 fuses `org_id > '001' AND (org_id, entity_id) >= ('003', '005')` into `RANGE SCAN ['003·005', *]` plus a server filter for the entity range. V2 emits `SKIP SCAN ON 2 RANGES ['003'] - [*]` with the lex-expanded RVC as the server filter — the two SKIP SCAN slots correspond directly to the disjuncts `(org=003, entity in [005, 008))` and `(org > 003, entity in (002, 008))`, which is a more precise match for the predicate than V1's wider single range plus filter. V2 reads the same or fewer rows.
 
 ### 10.3 Memory
 
@@ -622,18 +660,19 @@ Both characterization tests pass under V1 and V2 today. They pin the current cor
 
 Speculative fixes are not warranted until IT coverage produces a reproducer.
 
-### 11.4 Other legacy-parity gaps (documented, not yet converged)
+### 11.4 Other legacy-parity gaps (dual-pinned, follow-up work)
 
-From the prior work tracking in `WhereOptimizerV2Test`, several legacy-parity failures remain in the 138-test corpus. These are **byte-shape divergences** where V2 produces correct results with a scan width equivalent to or strictly better than V1, but asserts on specific byte sequences that differ:
+The earlier `WhereOptimizerV2Test` sibling-class harness was retired in favor of in-place dual-pinning via `BaseTest.isV2Optimizer()` (see §9). The full unit + IT sweeps now pass cleanly under both V1 and V2. The remaining test-side dual-pins fall into three categories, ordered by V2 desirability — none represent a runtime regression vs V1, only differences in the explain-plan shape and (in one case) a small extra residual filter:
 
-- **`RowValueConstructorKeyPart` clip logic** (Group A, ~11 tests). Legacy splits an RVC inequality into a leading equality prefix plus a trailing scalar when intersecting with overlapping scalar constraints. V2's per-dim model handles most shapes after normalization, but a few compound shapes still diverge in byte layout. No correctness impact; tests assert byte bytes, not row sets.
-- **Complex OR + multi-slot skip-scan shapes** (Group C, ~6 tests). Legacy's specialised DNF + skip-scan cardinality tracking produces specific byte layouts for OR-of-AND-of-range trees that V2 emits in a slightly different shape. Scan width typically equivalent.
-- **Hint-driven residual filter shape** (Group D, 2 tests). `/*+ RANGE_SCAN */` and `/*+ SKIP_SCAN */` with non-PK filters produce legacy-specific filter types (`RowKeyComparisonFilter`, `SingleKeyValueComparisonFilter`). V2 uses a generic residual path; functionally equivalent but test assertions check the specific filter class.
-- **DESC byte edge cases** (Group E, 2 tests). `testDescDecimalRange` (DECIMAL + DESC + range scan) and similar; boundary bytes differ by one due to `ByteUtil.previousKey` handling in compound-span splicing.
+**(a) V2 strictly better — scan-width win.** Most dual-pins fall here. V2 narrows the scan range (extracts a trailing PK predicate into the scan bound, emits SKIP SCAN where V1 emits RANGE SCAN with a server filter, etc.); HBase rejects rows pre-filter, fewer bytes shipped from regionserver. Examples: `CostBasedDecisionIT.testCostOverridesStaticPlanOrdering*`, `IndexUsageIT.testViewUses*TableIndex`, `PartialSystemCatalogIndexIT.testIndexesOfViewAndIndexHeadersCondition`, `TenantSpecificViewIndexCompileTest`, `QueryPlanTest.testExplainPlan` pairs #2 and #7, `QueryPlanTest.testTenantSpecificConnWithLimit`.
 
-**Status.** These tests are marked expected-divergent in the V2 parameterized harness; the scan-efficiency analysis in the redesign plan confirms V2 is equivalent-or-better on scan width for all of them. They remain on the follow-up list but do not block V2's default-on rollout because no correctness regression was found against real data in IT coverage.
+**(b) V2 marginally worse but correct — redundant residual.** V2 retains a residual server filter that the scan range already enforces. Same row count read, slight per-row CPU overhead. Known V2 conservatism on residual-pruning for RVC compounds; the residual is structurally redundant (the scan range and the residual encode the same bound). Examples: `QueryPlanTest.testExplainPlan` pairs #1, #3, #10, `StatementHintsCompilationTest.testSelectForceRangeScanForEH`. **Follow-up:** refine `RemoveExtractedNodesVisitorV2` to recognize when an RVC compound predicate is fully captured by the emitted scan range and prune it from the residual.
 
-**Fix location.** Each group has its own landing zone (per the redesign plan's "follow-up work items" section), incrementally addressed after V2 proves stable at default-on for a release.
+**(c) Equivalent scan, divergent explain string.** V1 and V2 cover the same rows but the explain output looks different (different scan-type label, different bracket layout, etc.). See §10.2 "Shape divergences that look like a regression in the explain string but aren't" for the worked examples (`testExplainPlan` pairs #9 and #29). The dual-pin exists only to keep the test stable across modes; no underlying runtime difference.
+
+In addition to the explain-plan dual-pins, several pure byte-shape divergences exist where V2 emits a trailing SEP byte that V1's `ScanUtil.setKey` per-slot path strips. These are equivalent (same admitted rows, just different byte encoding) and use the `WhereOptimizerTest.v2OptionalSep()` helper to express both forms in a single source line.
+
+**Status.** All categories pass the full `phoenix-core` test sweep (unit + IT) under both V1 and V2. Only category (b) carries an active follow-up work item; (a) is the steady-state target shape and (c) is V2-correct already.
 
 ## 12. Summary
 
