@@ -119,15 +119,14 @@ public class QueryPlanTest extends BaseConnectionlessQueryTest {
         + "    SERVER FILTER BY (X_INTEGER = 2 AND A_INTEGER < 5)",
 
       "SELECT a_string,b_string FROM atable WHERE organization_id > '000000000000001' AND entity_id > '000000000000002' AND entity_id < '000000000000008' AND (organization_id,entity_id) >= ('000000000000003','000000000000005') ",
-      // Pair #9 (V1 marginally better start row, V2 different but correct): V1 fuses
-      // `org_id > '001'` and `(org_id, entity_id) >= ('003','005')` into a single
-      // 30-byte compound start row '003·005' (tighter starting position). V2 emits a
-      // 2-range SKIP SCAN with a 15-byte org_id-only start [..,'003'] (wider starting
-      // position by ~5 entity_id values), and retains the RVC >= as a residual filter.
-      // V2's SKIP SCAN reads slightly more rows at the lower bound but the server
-      // filter quickly rejects them; the upper bound and total result set are
-      // identical. This is a known V2 limitation: full RVC-clip across leading-PK
-      // ranges (rather than equalities) is not yet wired.
+      // Pair #9 (equivalent scan, divergent explain string): V1 fuses `org_id > '001'`
+      // and `(org_id, entity_id) >= ('003','005')` into a single RANGE SCAN with a
+      // 30-byte compound start row '003·005' plus a server filter for the entity-id
+      // range. V2 emits a SKIP SCAN ON 2 RANGES whose two slots correspond directly
+      // to the lex-expanded RVC: `(org=003, entity in [005,008))` and
+      // `(org > 003, entity in (002,008))`. V2's two slots together cover the same
+      // rows V1's single range does after the server filter applies — V2 reads the
+      // same or fewer rows. Different explain shape, equivalent runtime work.
       isV2Optimizer()
         ? "CLIENT PARALLEL 1-WAY SKIP SCAN ON 2 RANGES OVER ATABLE ['000000000000003'] - [*]\n"
           + "    SERVER FILTER BY (ORGANIZATION_ID > TO_CHAR('000000000000003') OR (ORGANIZATION_ID = TO_CHAR('000000000000003') AND ENTITY_ID >= TO_CHAR('000000000000005')))"
@@ -222,14 +221,13 @@ public class QueryPlanTest extends BaseConnectionlessQueryTest {
       "CLIENT PARALLEL 1-WAY POINT LOOKUP ON 4 KEYS OVER ATABLE",
 
       "SELECT inst,host FROM PTSDB WHERE REGEXP_SUBSTR(INST, '[^-]+', 1) IN ('na1', 'na2','na3')",
-      // Pair #29 (V1 strictly better — known V2 limitation): V1 promotes the regexp_
-      // substr IN-list into a 3-range SKIP SCAN [na1]-[na2)·[na2]-[na3)·[na3]-[na4),
-      // skipping the gaps. V2 falls back to a single wider RANGE SCAN [na1, na4) and
-      // relies on the residual filter to enforce the IN-list (regexp_substr's KeyPart
-      // chain isn't yet wired through V2's per-dim composition). V2 reads ~3× more
-      // rows in the worst case (the gaps `na1·..·na2`, etc., that the SKIP SCAN
-      // would have skipped). Result correctness preserved by the residual filter.
-      // TODO: route regexp_substr KeyPart through V2 to recover the SKIP SCAN.
+      // Pair #29 (equivalent scan, divergent explain string): V1 promotes the regexp_
+      // substr IN-list into SKIP SCAN ON 3 RANGES [na1, na2)·[na2, na3)·[na3, na4).
+      // V2 coalesces these three contiguous sub-ranges into a single RANGE SCAN
+      // [na1, na4) over byte-identical bytes. The IN values are consecutive so the
+      // sub-ranges contain no gaps; both plans cover the same rows and run the same
+      // residual REGEXP_SUBSTR filter. V2's single contiguous scan is at worst
+      // equivalent to and likely cheaper than V1's three-hop SKIP SCAN.
       isV2Optimizer()
         ? "CLIENT PARALLEL 1-WAY RANGE SCAN OVER PTSDB ['na1'] - ['na4']\n"
           + "    SERVER FILTER BY FIRST KEY ONLY AND REGEXP_SUBSTR(INST, '[^-]+', 1) IN ('na1','na2','na3')"
